@@ -112,9 +112,11 @@ cypreact_parse_input <- function(text) {
   out
 }
 
-# Run the jar once over `smiles` for the given `cyps`. Returns a list with
-# rc, output (stdout+stderr combined) and the path to the output CSV.
-.cypreact_run_jar <- function(smiles, cyps, workdir) {
+# Run the jar once over `smiles` for the given `cyps`. Streams the Java output
+# line by line so progress can be reported per molecule (the tool prints
+# "Processing Molecue: N"). `on_molecule(n)` is called with each such N.
+# Returns a list with rc, output (stdout+stderr combined) and the output CSV.
+.cypreact_run_jar <- function(smiles, cyps, workdir, on_molecule = NULL) {
   in_csv  <- file.path(workdir, "input.csv")
   out_csv <- file.path(workdir, "output.csv")
   if (file.exists(out_csv)) unlink(out_csv)
@@ -127,7 +129,8 @@ cypreact_parse_input <- function(text) {
     paste0("-Duser.home=", shQuote(home)),
     paste0("-Djava.io.tmpdir=", shQuote(home))
   )
-  args <- c(
+  tokens <- c(
+    shQuote(cypreact_java()),
     jvm_opts,
     "-jar", shQuote(cypreact_jar()),
     shQuote(paste0(cypreact_bundle_dir(), .Platform$file.sep)),
@@ -135,15 +138,38 @@ cypreact_parse_input <- function(text) {
     shQuote(out_csv),
     shQuote(paste(cyps, collapse = ","))
   )
-  old <- getwd()
-  on.exit(setwd(old), add = TRUE)
-  setwd(cypreact_bundle_dir())
-  res <- suppressWarnings(
-    system2(cypreact_java(), args, stdout = TRUE, stderr = TRUE)
+  # Run inside the bundle dir; merge stderr into stdout; append an exit sentinel.
+  cmd <- paste0(
+    "cd ", shQuote(cypreact_bundle_dir()), " && ",
+    paste(tokens, collapse = " "),
+    " 2>&1; echo \"__CYPREACT_EXIT__:$?\""
   )
-  rc <- attr(res, "status")
-  if (is.null(rc)) rc <- 0L
-  list(rc = rc, output = paste(res, collapse = "\n"), out_csv = out_csv)
+
+  lines <- character(0)
+  rc <- NA_integer_
+  last_proc <- NA_integer_   # highest "Processing Molecue: N" seen (1-based)
+  con <- pipe(cmd, "r")
+  on.exit(try(close(con), silent = TRUE), add = TRUE)
+  repeat {
+    l <- tryCatch(readLines(con, n = 1L, warn = FALSE), error = function(e) character(0))
+    if (length(l) == 0L) break
+    if (startsWith(l, "__CYPREACT_EXIT__:")) {
+      rc <- suppressWarnings(as.integer(sub("^__CYPREACT_EXIT__:", "", l)))
+      next
+    }
+    lines <- c(lines, l)
+    m <- regmatches(l, regexpr("Processing Molecue:\\s*[0-9]+", l))
+    if (length(m) == 1L) {
+      num <- suppressWarnings(as.integer(gsub("\\D", "", m)))
+      if (!is.na(num)) {
+        last_proc <- num
+        if (!is.null(on_molecule)) try(on_molecule(num), silent = TRUE)
+      }
+    }
+  }
+  if (is.na(rc)) rc <- 0L
+  list(rc = rc, output = paste(lines, collapse = "\n"),
+       out_csv = out_csv, last_proc = last_proc)
 }
 
 # Read the output CSV into a list of rows: list(inchikey=, preds=named chr).
@@ -214,11 +240,12 @@ cypreact_predict <- function(smiles, cyps = CYPREACT_ALL_CYPS,
   retries <- 0L
   repeat {
     if (length(active) == 0) break
-    if (!is.null(progress)) {
-      progress(sprintf("Running CypReact on %d molecule(s)...", length(active)))
-    }
     submitted <- smiles[active]
-    run <- .cypreact_run_jar(submitted, requested, workdir)
+    total_sub <- length(submitted)
+    on_mol <- if (!is.null(progress)) {
+      function(n) progress(n, total_sub, sprintf("Molecule %d of %d", n, total_sub))
+    } else NULL
+    run <- .cypreact_run_jar(submitted, requested, workdir, on_molecule = on_mol)
     combined <- run$output
 
     # --- Detect an un-parseable SMILES that aborted the run ---------------
@@ -252,7 +279,24 @@ cypreact_predict <- function(smiles, cyps = CYPREACT_ALL_CYPS,
       }
     }
 
+    # --- Unexplained abort (parsed fine but crashed during prediction) ----
+    # Drop the molecule that was being processed when it died, record it as an
+    # error, and carry on so one bad molecule never stops the whole batch.
     if (!file.exists(run$out_csv)) {
+      lp <- run$last_proc
+      if (!is.na(lp) && lp >= 1 && lp <= length(active)) {
+        oi <- active[lp]
+        res[[oi]] <- list(
+          status = "error",
+          message = "CypReact could not process this molecule (skipped).",
+          inchikey = NA_character_, preds = NULL
+        )
+        active <- active[-lp]
+        retries <- retries + 1L
+        if (retries <= max_parse_retries) next
+      }
+      # Could not attribute the failure to a single molecule -> likely a global
+      # problem (environment, Java, native libs). Surface the real error.
       stop(paste0(
         "CypReact failed to run (exit code ", run$rc, ").\n",
         substr(combined, 1, 2000)

@@ -15,12 +15,22 @@ N = non-reactant
 
 ## Features
 
-- **Single molecule** input with one-click examples (caffeine, aspirin, ...).
+- **Single molecule** input with one-click examples (caffeine, aspirin, ...)
+  and a **live 2D structure preview**.
 - **Batch** input: paste many SMILES (one per line / comma-separated) or upload
   a `.csv` / `.txt` / `.smi` file.
 - Pick which CYP isoforms to run.
-- Colour-coded results table and **CSV download**.
+- Colour-coded results table with a **structure thumbnail per molecule** and
+  **CSV download**.
+- **Per-molecule progress bar** while a batch runs.
+- **Failures never stop a batch**: a SMILES that cannot be read (`parse error`)
+  or cannot be predicted (`error`), and molecules outside CypReact's scope
+  (`out of scope`), are still listed in the table while the rest are computed.
 - Robust handling of edge cases (see *How it works*).
+
+The 2D structure drawing is done entirely in the browser by
+[smiles-drawer](https://github.com/reymond-group/smilesDrawer) (vendored in
+`www/`, no extra R packages or network access needed).
 
 ## Requirements
 
@@ -76,6 +86,8 @@ export JAVA=/usr/bin/java                          # optional, if java is not on
 ```
 app.R                 # the Shiny app (UI + server)
 R/cypreact.R          # wrapper that drives cypreact.jar and aligns results
+www/
+  smiles-drawer.min.js  # client-side 2D structure rendering
 cypreact_bundle/      # vendored CypReact tool
   cypreact.jar
   supportfiles/       # per-isoform model + support files

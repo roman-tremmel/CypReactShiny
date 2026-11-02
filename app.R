@@ -49,6 +49,30 @@ ui <- fluidPage(
     .cr-badge-filtered { background:#fff4e5; color:#9a6400; }
     .cr-badge-error    { background:#fdeaea; color:#b3261e; }
     .cr-legend { font-size:13px; color:#5b6370; }
+    .cr-struct { display:block; margin:0 auto; }
+    .cr-preview-wrap { margin:8px 0 4px 0; }
+    .cr-preview { width:100%; max-width:300px; height:190px; border:1px solid #e3e6ea;
+                  border-radius:8px; background:#fff; display:block; }
+  ")),
+  tags$script(src = "smiles-drawer.min.js"),
+  tags$script(HTML("
+    Shiny.addCustomMessageHandler('cypreact_draw', function(msg){
+      try {
+        var el = document.getElementById(msg.id);
+        if (!el || typeof SmiDrawer === 'undefined') return;
+        if (!msg.smiles) { el.innerHTML = ''; return; }
+        var d = new SmiDrawer({width: msg.width || 300, height: msg.height || 190}, {});
+        d.draw(msg.smiles, '#' + msg.id, msg.theme || 'light', null, function(err){
+          el.innerHTML = '<text x=\"8\" y=\"20\" fill=\"#b3261e\" font-size=\"12\">invalid SMILES</text>';
+        });
+      } catch(e) {}
+    });
+    // Re-draw all [data-smiles] cells after a DataTables redraw (paging/sort).
+    window.cypreactDrawTable = function(){
+      try { if (typeof SmilesDrawer !== 'undefined') {
+        SmilesDrawer.apply({width:120, height:84}, {}, 'data-smiles', 'light');
+      } } catch(e) {}
+    };
   "))),
 
   titlePanel(
@@ -81,7 +105,10 @@ ui <- fluidPage(
               actionLink(paste0("ex_", make.names(nm)), nm,
                          style = "margin-right:8px;")
             })
-        )
+        ),
+        tags$small("Structure preview"),
+        div(class = "cr-preview-wrap",
+            HTML('<svg id="cr-preview" class="cr-preview"></svg>'))
       ),
 
       conditionalPanel(
@@ -135,7 +162,10 @@ ui <- fluidPage(
               " e.g. mixture / very large / sugar / lipid – treated as non-reactant",
               span(style = "margin:0 10px;", "·"),
               span(class = "cr-badge cr-badge-error", "parse error"),
-              " SMILES could not be read"
+              " SMILES could not be read",
+              span(style = "margin:0 10px;", "·"),
+              span(class = "cr-badge cr-badge-error", "error"),
+              " could not be predicted – skipped, batch continues"
           )
       ),
       div(class = "cr-legend",
@@ -160,6 +190,17 @@ server <- function(input, output, session) {
   observeEvent(input$cyp_all,  updateCheckboxGroupInput(session, "cyps", selected = CYPREACT_ALL_CYPS))
   observeEvent(input$cyp_none, updateCheckboxGroupInput(session, "cyps", selected = character(0)))
 
+  # Live 2D structure preview for the single-molecule SMILES (client-side).
+  observe({
+    input$mode  # redraw when switching back to single mode
+    smi <- cypreact_parse_input(input$smiles_single)
+    session$sendCustomMessage("cypreact_draw", list(
+      id = "cr-preview",
+      smiles = if (length(smi) > 0) smi[1] else "",
+      width = 300, height = 190, theme = "light"
+    ))
+  })
+
   # Append uploaded file contents to the batch text area.
   observeEvent(input$smiles_file, {
     f <- input$smiles_file
@@ -181,11 +222,13 @@ server <- function(input, output, session) {
     validate(need(length(smiles) > 0, "Please enter at least one SMILES string."))
     validate(need(length(input$cyps) > 0, "Please select at least one CYP450 isoform."))
 
-    withProgress(message = "Predicting...", value = 0.3, {
+    withProgress(message = "Running CypReact...", value = 0, {
       tryCatch(
         cypreact_predict(
           smiles, cyps = input$cyps,
-          progress = function(msg) setProgress(detail = msg)
+          progress = function(done, total, label) {
+            setProgress(value = if (total > 0) done / total else 0, detail = label)
+          }
         ),
         error = function(e) {
           showNotification(conditionMessage(e), type = "error", duration = NULL)
@@ -201,14 +244,14 @@ server <- function(input, output, session) {
     n       <- nrow(df)
     n_ok    <- sum(df$status == "ok")
     n_filt  <- sum(df$status == "filtered")
-    n_err   <- sum(df$status == "parse_error")
+    n_err   <- sum(df$status %in% c("parse_error", "error"))
     div(class = "cr-card",
         span(class = "cr-badge cr-badge-ok",
              sprintf("%d predicted", n_ok)),
         if (n_filt > 0) span(class = "cr-badge cr-badge-filtered",
              style = "margin-left:8px;", sprintf("%d out of scope", n_filt)),
         if (n_err > 0) span(class = "cr-badge cr-badge-error",
-             style = "margin-left:8px;", sprintf("%d could not be parsed", n_err)),
+             style = "margin-left:8px;", sprintf("%d could not be processed", n_err)),
         span(style = "margin-left:10px; color:#5b6370;",
              sprintf("· %d molecule(s) total", n))
     )
@@ -220,7 +263,7 @@ server <- function(input, output, session) {
     if (is.null(df)) return(NULL)
     cyp_cols <- intersect(CYPREACT_ALL_CYPS, names(df))
     status_label <- c(ok = "predicted", filtered = "out of scope",
-                      parse_error = "parse error")[df$status]
+                      parse_error = "parse error", error = "error")[df$status]
     out <- data.frame(
       "#" = seq_len(nrow(df)),
       SMILES = df$smiles,
@@ -233,16 +276,43 @@ server <- function(input, output, session) {
     out
   })
 
+  # Escape a string so it is safe inside an HTML attribute.
+  esc_attr <- function(x) {
+    x <- gsub("&", "&amp;", x, fixed = TRUE)
+    x <- gsub("<", "&lt;",  x, fixed = TRUE)
+    x <- gsub(">", "&gt;",  x, fixed = TRUE)
+    x <- gsub('"', "&quot;", x, fixed = TRUE)
+    x
+  }
+
   output$results <- DT::renderDataTable({
     out <- display_df()
     if (is.null(out)) return(NULL)
     cyp_cols <- intersect(CYPREACT_ALL_CYPS, names(out))
 
+    # Insert a client-side 2D structure column (drawn by smiles-drawer).
+    struct <- vapply(out$SMILES, function(s) {
+      sprintf('<svg class="cr-struct" data-smiles="%s" width="120" height="84"></svg>',
+              esc_attr(s))
+    }, character(1), USE.NAMES = FALSE)
+    out$Structure <- struct
+    ordered <- c("#", "SMILES", "Structure", "Status", cyp_cols, "InChIKey", "Note")
+    out <- out[, intersect(ordered, names(out)), drop = FALSE]
+
+    # We render raw HTML (the SVG column), so escape is FALSE globally; the only
+    # user-supplied text column (SMILES) is HTML-escaped by hand here.
+    out$SMILES <- esc_attr(out$SMILES)
+
+    # 0-based column indices to centre (structure + CYP columns).
+    center0 <- match(c("Structure", cyp_cols), names(out)) - 1L
+
     dt <- DT::datatable(
-      out, rownames = FALSE, escape = TRUE,
+      out, rownames = FALSE, escape = FALSE,
       options = list(
         pageLength = 25, scrollX = TRUE,
-        columnDefs = list(list(className = "dt-center", targets = cyp_cols))
+        columnDefs = list(list(className = "dt-center", targets = center0)),
+        # Re-render all structure SVGs after each DataTables draw (paging/sort).
+        drawCallback = DT::JS("function(settings){ if(window.cypreactDrawTable) window.cypreactDrawTable(); }")
       )
     )
     # Colour R / N cells.
@@ -254,6 +324,15 @@ server <- function(input, output, session) {
         backgroundColor = DT::styleEqual(c("R"), c("#e7f5ec"))
       )
     }
+    # Tint the status of failed / out-of-scope rows.
+    dt <- DT::formatStyle(
+      dt, "Status",
+      color = DT::styleEqual(
+        c("predicted", "out of scope", "parse error", "error"),
+        c("#0a7d33", "#9a6400", "#b3261e", "#b3261e")
+      ),
+      fontWeight = "bold"
+    )
     dt
   })
 
