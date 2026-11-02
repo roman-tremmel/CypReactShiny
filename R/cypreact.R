@@ -47,6 +47,21 @@ cypreact_java <- function() {
   if (nzchar(j)) j else "java"
 }
 
+# CypReact (via CDK) uses the JNI-InChI native library, which jnati unpacks at
+# runtime into "$HOME/.jnati/repo/...". On hardened hosts such as Posit Connect
+# the process HOME (e.g. /home/rstudio-connect) is NOT writable, which makes the
+# tool crash with "Error creating directory: .../.jnati/repo/...". To avoid any
+# server configuration we point the JVM's user.home at a writable directory we
+# control (reused for the whole R session so the native code is unpacked once).
+cypreact_home <- function() {
+  env <- Sys.getenv("CYPREACT_HOME", "")
+  dir <- if (nzchar(env)) env else file.path(tempdir(), "cypreact_jnati_home")
+  if (!dir.exists(dir)) {
+    dir.create(file.path(dir, ".jnati", "repo"), recursive = TRUE, showWarnings = FALSE)
+  }
+  normalizePath(dir, mustWork = FALSE)
+}
+
 # Quick environment check; returns NULL if OK, otherwise an explanatory string.
 cypreact_check_env <- function() {
   jar <- cypreact_jar()
@@ -105,7 +120,15 @@ cypreact_parse_input <- function(text) {
   if (file.exists(out_csv)) unlink(out_csv)
   writeLines(smiles, in_csv, useBytes = TRUE)
 
+  # JVM options: redirect user.home (and java.io.tmpdir) to writable dirs so
+  # the JNI-InChI native library can be unpacked even when $HOME is read-only.
+  home <- cypreact_home()
+  jvm_opts <- c(
+    paste0("-Duser.home=", shQuote(home)),
+    paste0("-Djava.io.tmpdir=", shQuote(home))
+  )
   args <- c(
+    jvm_opts,
     "-jar", shQuote(cypreact_jar()),
     shQuote(paste0(cypreact_bundle_dir(), .Platform$file.sep)),
     shQuote(in_csv),
